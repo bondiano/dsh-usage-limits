@@ -1,0 +1,8 @@
+# Usage limits bundle: one Host row that serves the limits snapshot over a
+# same-origin plugin route, and its Client half that draws the sidebar entry.
+- insert:
+    - id: usage-limits
+      name: '@local/dsh-usage-limits'
+      config:
+        refreshSeconds: 60
+        requestTimeoutMs: 8000

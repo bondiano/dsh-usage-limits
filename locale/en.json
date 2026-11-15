@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Usage limits",
+    "description": "Adds a Limits entry to the left sidebar that opens a panel with every limit this machine can observe: OpenCode Go, Z.AI, OpenAI Codex, and DeepSeek quota windows and balances, the default model's context and output capacity, and the deployment's subagent, image, and automation limits. Quota windows show used percentage, a progress bar, and the reset time; the panel refreshes automatically and has a manual Refresh action. Data comes from the providers' own account endpoints using the credentials already stored in DSH; keys never reach the browser. A provider without a stored credential is listed with a hint instead of a quota."
+  }
+}
