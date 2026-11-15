@@ -11,14 +11,79 @@
  * @module @local/dsh-usage-limits
  */
 
+import { readFile, readdir } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
+
 /** Route the Client half reads; same origin, GET/HEAD only. */
 const ROUTE = '/plugin-api/usage-limits/limits'
+
+/** The provider rows the panel asks for one at a time, in display order. */
+const PROVIDER_IDS = Object.freeze([
+  'opencode-go', 'zai', 'deepseek',
+  'openai-codex', 'claude', 'grok', 'github-copilot', 'google-antigravity',
+])
 
 /** Provider endpoints, all account-level and read-only. */
 const OPENCODE_GO_URL = 'https://opencode.ai/zen/go/v1/usage'
 const ZAI_URL = 'https://api.z.ai/api/monitor/usage/quota/limit'
 const DEEPSEEK_BALANCE_URL = 'https://api.deepseek.com/user/balance'
 const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
+const COPILOT_QUOTA_URL = 'https://api.github.com/copilot_internal/user'
+const ANTIGRAVITY_QUOTA_URL = 'https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary'
+const ANTIGRAVITY_CODE_ASSIST_URL = 'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist'
+const ANTIGRAVITY_TOKEN_URL = 'https://oauth2.googleapis.com/token'
+const CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+const CLAUDE_TOKEN_URL = 'https://claude.ai/v1/oauth/token'
+const GROK_BILLING_URL = 'https://cli-chat-proxy.grok.com/v1/billing?format=credits'
+const GROK_DEFAULT_TOKEN_URL = 'https://auth.x.ai/oauth2/token'
+
+/** Public OAuth client ids of the Claude Code and Grok CLI apps. */
+const CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+const GROK_CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828'
+
+/** Claude's usage endpoint identifies the caller as the Claude Code CLI. */
+const CLAUDE_USER_AGENT = 'claude-cli/2.1.283 (external, cli)'
+
+/** Grok's billing endpoint only answers the CLI's own token-auth header. */
+const GROK_TOKEN_AUTH = 'xai-grok-cli'
+
+/** Display names for the numeric subscription tiers xAI stamps on its tokens. */
+const GROK_TIERS = Object.freeze({
+  0: 'Free',
+  1: 'SuperGrok',
+  2: 'X Basic',
+  3: 'X Premium',
+  4: 'X Premium+',
+  5: 'SuperGrok Heavy',
+  6: 'SuperGrok Lite',
+  7: 'SuperGrok Plus',
+})
+
+/**
+ * The public Antigravity desktop OAuth client identity is read from the
+ * installed subscriptions bundle (see `antigravityClient`) so this plugin
+ * carries no OAuth client credential of its own. The refresh token that
+ * actually authorizes a call stays in the Host.
+ */
+/** Antigravity calls this CLI identity its backend expects. */
+const ANTIGRAVITY_USER_AGENT = `antigravity/cli/1.3.4 (${process.platform}; ${process.arch})`
+/** Antigravity gates its v1internal methods behind this assistant metadata. */
+const ANTIGRAVITY_METADATA = Object.freeze({
+  ideType: 'ANTIGRAVITY', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI',
+})
+/** The account-wide quota families Antigravity reports, in display order. */
+const ANTIGRAVITY_SCOPES = Object.freeze(['Gemini Models', 'Claude and GPT models', 'Gemini 4 Argon'])
+
+/**
+ * The subscription plugin's OAuth document, relative to the harness home.
+ * `dsh-plugin-subscriptions` owns the ChatGPT/Codex, Claude, Grok, GitHub
+ * Copilot, and Google Antigravity logins made from Settings → Subscriptions;
+ * that document, not the credential plane, is where those grants live.
+ */
+const SUBSCRIPTIONS_DOCUMENT = Object.freeze(['plugins', 'subscriptions', 'auth.json'])
 
 /** Attribution for the background polls, matching each provider's expectation. */
 const USER_AGENT = 'DeepSeek-Harness-usage-limits/0.1'
@@ -26,8 +91,31 @@ const USER_AGENT = 'DeepSeek-Harness-usage-limits/0.1'
 /** Stable per-process session id for the OpenCode Go usage poll. */
 const OPENCODE_SESSION = (globalThis.crypto?.randomUUID?.() ?? `usage-${Date.now()}`)
 
+/**
+ * Refreshed OAuth access tokens, keyed by provider and refresh token. The
+ * subscription document stays the plugin's to write; this cache only carries
+ * a token this process obtained between snapshot reads.
+ */
+const refreshedTokens = new Map()
+
 /** Resolved defaults for a row that omits its config. */
 const DEFAULTS = Object.freeze({ refreshSeconds: 60, requestTimeoutMs: 8000 })
+
+/** Short plan labels for the identifiers providers report. */
+const PLAN_LABELS = Object.freeze({
+  free: 'Free',
+  plus: 'Plus',
+  pro: 'Pro',
+  promax: 'Pro Max',
+  team: 'Team',
+  business: 'Business',
+  enterprise: 'Enterprise',
+  individual: 'Individual',
+  individual_max: 'Individual Max',
+  max: 'Max',
+  supergrok: 'SuperGrok',
+  'supergrok heavy': 'SuperGrok Heavy',
+})
 
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
@@ -36,7 +124,12 @@ const DAY_MS = 24 * HOUR_MS
 export const inject = ['webServer']
 
 /**
- * Register the limits snapshot route.
+ * Register the limits route.
+ *
+ * The panel asks per block — `?provider=<id>` for one provider card and
+ * `?section=overview` for the model and platform cards — so a slow provider
+ * cannot hold the others behind it. One request without those parameters still
+ * answers the whole snapshot for callers that want it in one round trip.
  * @param ctx - Host plugin context carrying `webServer` and the optional services read below.
  * @param config - row config: `refreshSeconds`, `requestTimeoutMs`.
  */
@@ -45,27 +138,32 @@ export function apply(ctx, config = {}) {
     refreshSeconds: positive(config?.refreshSeconds, DEFAULTS.refreshSeconds),
     requestTimeoutMs: positive(config?.requestTimeoutMs, DEFAULTS.requestTimeoutMs),
   }
-  let cached
-  let cachedAt = 0
-  let inflight
+  /** Cached answers per block key, and the polls currently producing them. */
+  const cached = new Map()
+  const inflight = new Map()
+  const ttl = resolved.refreshSeconds * 1000
 
   /**
-   * Answer with a snapshot, reusing the cached one inside the refresh window.
-   * @param force - true to bypass the cache (the panel's Refresh action).
-   * @returns the snapshot.
+   * Answer one block from its cache inside the refresh window, sharing an
+   * in-flight poll between the cards and the aggregate route.
+   * @param key - cache key: `provider:<id>` or `overview`.
+   * @param force - true to bypass the cache (a card's Refresh action).
+   * @param produce - the read to run when the cache is stale.
+   * @returns the block value.
    */
-  function snapshot(force) {
-    const fresh = !force && cached !== undefined && Date.now() - cachedAt < resolved.refreshSeconds * 1000
-    if (fresh) return Promise.resolve(cached)
-    if (inflight !== undefined) return inflight
-    inflight = collect(ctx, resolved)
-      .then((result) => {
-        cached = result
-        cachedAt = Date.now()
-        return result
+  function remember(key, force, produce) {
+    const hit = cached.get(key)
+    if (!force && hit !== undefined && Date.now() - hit.at < ttl) return Promise.resolve(hit.value)
+    const running = inflight.get(key)
+    if (running !== undefined) return running
+    const poll = produce()
+      .then((value) => {
+        cached.set(key, { value, at: Date.now() })
+        return value
       })
-      .finally(() => { inflight = undefined })
-    return inflight
+      .finally(() => { inflight.delete(key) })
+    inflight.set(key, poll)
+    return poll
   }
 
   ctx.effect(() => ctx.webServer.register({
@@ -76,12 +174,31 @@ export function apply(ctx, config = {}) {
         return new Response('method not allowed', { status: 405, headers: { allow: 'GET, HEAD' } })
       }
       if (!trusted(request)) return new Response('forbidden', { status: 403 })
+      const url = new URL(request.url)
+      const force = url.searchParams.get('refresh') === '1'
+      const generatedAt = new Date().toISOString()
       try {
-        const url = new URL(request.url)
-        const data = await snapshot(url.searchParams.get('refresh') === '1')
-        return json(data)
+        const provider = url.searchParams.get('provider')
+        if (provider !== null) {
+          if (!PROVIDER_IDS.includes(provider)) {
+            return json({ generatedAt, error: `unknown provider "${provider}"` }, 400)
+          }
+          const section = await remember(`provider:${provider}`, force,
+            () => readProviderSection(ctx, resolved, provider))
+          return json({ generatedAt, refreshSeconds: resolved.refreshSeconds, provider: section })
+        }
+        if (url.searchParams.get('section') === 'overview') {
+          const overview = await remember('overview', force, () => readOverview(ctx, resolved))
+          return json({ generatedAt, refreshSeconds: resolved.refreshSeconds, ...overview })
+        }
+        const [providers, overview] = await Promise.all([
+          Promise.all(PROVIDER_IDS.map((id) => remember(`provider:${id}`, force,
+            () => readProviderSection(ctx, resolved, id)))),
+          remember('overview', force, () => readOverview(ctx, resolved)),
+        ])
+        return json({ generatedAt, refreshSeconds: resolved.refreshSeconds, providers, ...overview })
       } catch (error) {
-        return json({ generatedAt: new Date().toISOString(), error: reason(error) }, 500)
+        return json({ generatedAt, error: reason(error) }, 500)
       }
     },
   }), 'usage-limits: limits route')
@@ -132,30 +249,169 @@ function json(data, status = 200) {
 }
 
 /**
- * Build the complete snapshot; every section fails independently.
+ * Read one provider section by its route id; every section fails independently.
  * @param ctx - Host plugin context.
  * @param config - resolved row config.
- * @returns the snapshot value.
+ * @param id - provider id from {@link PROVIDER_IDS}.
+ * @returns the provider section.
  */
-async function collect(ctx, config) {
+async function readProviderSection(ctx, config, id) {
   const credentials = service(ctx, 'credentials')
-  const readKey = keyReader(credentials)
-
-  const [opencodeGo, zai, deepseek, codex] = await Promise.all([
-    readOpencodeGo(readKey, config),
-    readZai(readKey, config),
-    readDeepseek(readKey, config),
-    readCodex(credentials, config),
-  ])
-  const [model, platform] = await Promise.all([readModel(ctx, config), readPlatform(ctx)])
-
-  return {
-    generatedAt: new Date().toISOString(),
-    refreshSeconds: config.refreshSeconds,
-    providers: [opencodeGo, zai, deepseek, codex],
-    model,
-    platform,
+  switch (id) {
+    case 'opencode-go': return readOpencodeGo(keyReader(credentials), config)
+    case 'zai': return readZai(keyReader(credentials), config)
+    case 'deepseek': return readDeepseek(keyReader(credentials), config)
+    case 'openai-codex': return readCodex(credentials, config)
+    case 'claude': return readClaude(credentials, config)
+    case 'grok': return readGrok(credentials, config)
+    case 'github-copilot': return readCopilot(credentials, config)
+    case 'google-antigravity': return readAntigravity(credentials, config)
+    default: return undefined
   }
+}
+
+/**
+ * Read the deployment-owned cards: the default model and the platform limits.
+ * @param ctx - Host plugin context.
+ * @param config - resolved row config.
+ * @returns the overview sections.
+ */
+async function readOverview(ctx, config) {
+  const [model, platform] = await Promise.all([readModel(ctx, config), readPlatform(ctx)])
+  return { model, platform }
+}
+
+/**
+ * Read one OAuth grant payload from the credential plane.
+ * @param credentials - the optional credentials service.
+ * @param key - exact credential record key.
+ * @returns the grant payload, or undefined when no grant is stored.
+ */
+async function grantPayload(credentials, key) {
+  try {
+    const record = await credentials?.readRecord(key)
+    return record?.kind === 'grant' ? record.payload : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Read the subscription plugin's document. It is the durable store behind
+ * Settings → Subscriptions, so its grants are exactly the logins that plugin
+ * serves requests with.
+ * @returns the parsed document, or undefined when that bundle is not installed.
+ */
+async function subscriptionStore() {
+  let text
+  try {
+    text = await readFile(join(harnessHome(), ...SUBSCRIPTIONS_DOCUMENT), 'utf8')
+  } catch {
+    return undefined
+  }
+  try {
+    const parsed = JSON.parse(text)
+    return parsed !== null && typeof parsed === 'object' ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Resolve the default account's session for one subscription provider. Older
+ * single-account documents keep the session fields at the entry root, so both
+ * shapes are accepted.
+ * @param provider - subscription provider id, such as `codex` or `copilot`.
+ * @returns the session object, or undefined when the provider has no account.
+ */
+async function subscriptionSession(provider) {
+  const store = await subscriptionStore()
+  const entry = store?.[provider]
+  if (entry === null || typeof entry !== 'object') return undefined
+  const accounts = entry.accounts
+  if (accounts === null || typeof accounts !== 'object') return entry
+  const keys = Object.keys(accounts)
+  if (keys.length === 0) return undefined
+  const preferred = typeof entry.default === 'string' && Object.hasOwn(accounts, entry.default)
+    ? entry.default
+    : keys[0]
+  const session = accounts[preferred]
+  return session !== null && typeof session === 'object' ? session : undefined
+}
+
+/** @returns this machine's harness home. */
+function harnessHome() {
+  const configured = typeof process !== 'undefined' ? process.env?.DSH_HOME?.trim() : undefined
+  return configured !== undefined && configured !== '' ? configured : join(homedir(), '.dsh')
+}
+
+let antigravityClientPromise
+
+/**
+ * Resolve the public Antigravity desktop OAuth client. The identity is
+ * distributed by the subscriptions bundle and the Antigravity app, never as a
+ * per-user credential; it is read from the installed bundle instead of being
+ * duplicated here. `DSH_ANTIGRAVITY_CLIENT_ID` and
+ * `DSH_ANTIGRAVITY_CLIENT_SECRET` override the lookup.
+ * @returns the public client id and secret.
+ */
+function antigravityClient() {
+  antigravityClientPromise ??= resolveAntigravityClient()
+  return antigravityClientPromise
+}
+
+/** @returns the client identity from the environment or the subscriptions bundle. */
+async function resolveAntigravityClient() {
+  const configuredId = process.env?.DSH_ANTIGRAVITY_CLIENT_ID?.trim()
+  const configuredSecret = process.env?.DSH_ANTIGRAVITY_CLIENT_SECRET?.trim()
+  if (configuredId !== undefined && configuredId !== '' && configuredSecret !== undefined && configuredSecret !== '') {
+    return { id: configuredId, secret: configuredSecret }
+  }
+  const profiles = join(harnessHome(), 'profiles')
+  const profileDirs = []
+  const active = process.env?.DSH_PROFILE_DIR?.trim()
+  if (active !== undefined && active !== '') profileDirs.push(active)
+  try {
+    for (const name of await readdir(profiles)) profileDirs.push(join(profiles, name))
+  } catch {
+    // A harness home without profiles still allows the environment override.
+  }
+  for (const dir of profileDirs) {
+    try {
+      const requireFromProfile = createRequire(join(dir, 'package.json'))
+      const manifest = requireFromProfile.resolve('dsh-plugin-subscriptions/package.json')
+      const modulePath = join(dirname(manifest), 'lib', 'providers', 'antigravity-oauth-client.js')
+      const client = await import(pathToFileURL(modulePath).href)
+      const id = client.ANTIGRAVITY_DEFAULT_CLIENT_ID
+      const secret = client.ANTIGRAVITY_DEFAULT_CLIENT_SECRET
+      if (typeof id === 'string' && id !== '' && typeof secret === 'string' && secret !== '') {
+        return { id, secret }
+      }
+    } catch {
+      // Try the next installed profile.
+    }
+  }
+  throw new SubscriptionAuthError(
+    'the Antigravity OAuth client is unavailable; install dsh-plugin-subscriptions or set DSH_ANTIGRAVITY_CLIENT_ID and DSH_ANTIGRAVITY_CLIENT_SECRET',
+  )
+}
+
+/**
+ * Turn a provider plan identifier into the short label the panel renders.
+ * @param value - raw plan id, such as `promax` or `individual_max`.
+ * @returns a display label, or undefined when the provider named no plan.
+ */
+function planLabel(value) {
+  if (typeof value !== 'string' || value.trim() === '') return undefined
+  const known = PLAN_LABELS[value.trim().toLowerCase()]
+  return known ?? value.trim()
+}
+
+/** @param value - `YYYY-MM-DD`. @returns its UTC-midnight instant in ms, or undefined. */
+function dateOnlyMs(value) {
+  if (typeof value !== 'string' || value === '') return undefined
+  const parsed = Date.parse(`${value}T00:00:00Z`)
+  return Number.isFinite(parsed) && parsed < 8.64e15 ? parsed : undefined
 }
 
 /**
@@ -348,46 +604,696 @@ async function readDeepseek(readKey, config) {
 }
 
 /**
- * Read the Codex plan windows from a stored OAuth grant, when one exists.
+ * Read the GitHub Copilot quota windows.
+ *
+ * `copilot_internal/user` is the account endpoint the Copilot editor
+ * extensions read: it reports the monthly quota snapshots and the plan. The
+ * long-lived GitHub token (`refreshToken`) is the one that works there; the
+ * stored Copilot API token (`accessToken`) is short-lived and is only a
+ * fallback while it is still valid.
+ * @param credentials - the optional credentials service.
+ * @param config - resolved row config.
+ * @returns a provider section.
+ */
+async function readCopilot(credentials, config) {
+  const provider = { id: 'github-copilot', name: 'GitHub Copilot', kind: 'quota', windows: [] }
+  const session = await subscriptionSession('copilot')
+  const github = firstString(session?.refreshToken, session?.refresh)
+  const access = firstString(session?.accessToken, session?.access)
+  const grant = await grantPayload(credentials, 'llm-pi-ai/github-copilot')
+  const grantToken = firstString(grant?.refreshToken, grant?.refresh, grant?.accessToken, grant?.access)
+  const expiresAt = expiryMs(session)
+  let token = github
+  if (token === undefined && access !== undefined) {
+    if (expiresAt === undefined || expiresAt > Date.now()) token = access
+  }
+  if (token === undefined) token = grantToken
+  if (token === undefined) {
+    if (access !== undefined || grantToken !== undefined) return { ...provider, status: 'expired' }
+    return { ...provider, status: 'no-credential' }
+  }
+  const headers = { accept: 'application/json', authorization: `token ${token}`, 'user-agent': USER_AGENT }
+  try {
+    const response = await timedFetch(COPILOT_QUOTA_URL, { headers }, config)
+    if (!response.ok) return httpFailure(provider, response)
+    const payload = await response.json()
+    const plan = planLabel(firstString(payload?.copilot_plan))
+    return {
+      ...provider,
+      status: 'ok',
+      windows: copilotWindows(payload),
+      ...(plan === undefined ? {} : { plan }),
+    }
+  } catch (error) {
+    return { ...provider, status: 'error', message: reason(error) }
+  }
+}
+
+/**
+ * Map the Copilot account body to normalized quota windows. Unlimited
+ * buckets carry no measured quota and stay out; a current body reports
+ * `quota_snapshots`, while older plans report a monthly/limited quota pair.
+ * @param payload - `/copilot_internal/user` body.
+ * @returns normalized windows.
+ */
+function copilotWindows(payload) {
+  const windows = []
+  const seen = new Set()
+  const resetAt = isoMs(payload?.quota_reset_date_utc) ?? dateOnlyMs(payload?.quota_reset_date)
+  const snapshots = payload?.quota_snapshots
+  if (snapshots !== null && typeof snapshots === 'object') {
+    for (const [id, snapshot] of Object.entries(snapshots)) {
+      if (snapshot === null || typeof snapshot !== 'object' || snapshot.unlimited === true) continue
+      const entitlement = number(snapshot.entitlement)
+      const remaining = number(snapshot.remaining)
+      const percentRemaining = number(snapshot.percent_remaining)
+      let used
+      let limit
+      let usedPercent
+      if (entitlement !== undefined && entitlement > 0 && remaining !== undefined) {
+        used = Math.max(entitlement - remaining, 0)
+        limit = entitlement
+        usedPercent = clampPercent(used / entitlement * 100)
+      } else if (percentRemaining !== undefined) {
+        usedPercent = clampPercent(100 - percentRemaining)
+      } else {
+        continue
+      }
+      seen.add(id)
+      windows.push({
+        window: copilotWindowId(id),
+        label: copilotWindowLabel(id),
+        kind: used === undefined ? 'tokens' : 'requests',
+        usedPercent,
+        ...(used === undefined ? {} : { used, limit }),
+        resetsAt: isoMs(snapshot.quota_reset_at) ?? resetAt,
+      })
+    }
+  }
+  const monthly = payload?.monthly_quotas
+  const limited = payload?.limited_user_quotas
+  if (monthly !== null && typeof monthly === 'object'
+    && limited !== null && typeof limited === 'object') {
+    for (const [id, total] of Object.entries(monthly)) {
+      if (seen.has(id)) continue
+      const limit = number(total)
+      const remaining = number(limited[id])
+      if (limit === undefined || limit <= 0 || remaining === undefined) continue
+      windows.push({
+        window: copilotWindowId(id),
+        label: copilotWindowLabel(id),
+        kind: 'requests',
+        usedPercent: clampPercent((limit - remaining) / limit * 100),
+        used: Math.max(limit - remaining, 0),
+        limit,
+        resetsAt: isoMs(payload?.limited_user_reset_date) ?? resetAt,
+      })
+    }
+  }
+  return windows
+}
+
+/** @param id - a Copilot quota bucket id. @returns a stable window id. */
+function copilotWindowId(id) {
+  if (id === 'premium_interactions') return 'premium'
+  if (id === 'chat') return 'chat'
+  if (id === 'completions') return 'completions'
+  return id.replace(/[^a-z0-9]+/gi, '-').toLowerCase()
+}
+
+/** @param id - a Copilot quota bucket id. @returns its English fallback label. */
+function copilotWindowLabel(id) {
+  if (id === 'premium_interactions') return 'Premium requests'
+  if (id === 'chat') return 'Chat requests'
+  if (id === 'completions') return 'Code completions'
+  return id.replace(/_/g, ' ')
+}
+
+/**
+ * Read the Claude plan windows.
+ *
+ * The OAuth usage endpoint behind Claude Code's `/usage` screen reports a
+ * structured `limits` array on newer responses and flat buckets on older ones;
+ * both are read, the array winning when it carries entries. The access token
+ * lives about a day, so an expired one is refreshed through the Claude Code
+ * OAuth client and kept only in this process.
+ * @param credentials - the optional credentials service.
+ * @param config - resolved row config.
+ * @returns a provider section.
+ */
+async function readClaude(credentials, config) {
+  const provider = { id: 'claude', name: 'Claude', kind: 'quota', windows: [] }
+  const session = await subscriptionSession('claude')
+  const stored = firstString(session?.accessToken, session?.access)
+  const refresh = firstString(session?.refreshToken, session?.refresh)
+  if (stored === undefined && refresh === undefined) return { ...provider, status: 'no-credential' }
+  let access
+  try {
+    access = await claudeAccess(session, stored, refresh, false, config)
+  } catch (error) {
+    return subscriptionFailure(provider, error)
+  }
+  if (access === undefined) return { ...provider, status: 'expired' }
+  try {
+    let response = await timedFetch(CLAUDE_USAGE_URL, { headers: claudeHeaders(access) }, config)
+    if (response.status === 401 || response.status === 403) {
+      access = await claudeAccess(session, stored, refresh, true, config)
+      if (access === undefined) return { ...provider, status: 'expired' }
+      response = await timedFetch(CLAUDE_USAGE_URL, { headers: claudeHeaders(access) }, config)
+    }
+    if (!response.ok) return httpFailure(provider, response)
+    const payload = await response.json()
+    const plan = planLabel(firstString(session?.subscriptionType, session?.plan))
+    return {
+      ...provider,
+      status: 'ok',
+      windows: claudeWindows(payload),
+      ...(plan === undefined ? {} : { plan }),
+    }
+  } catch (error) {
+    return subscriptionFailure(provider, error)
+  }
+}
+
+/**
+ * Resolve a Claude access token: the newest usable one from this process or
+ * the document, refreshing through the Claude Code OAuth client when needed.
+ * @param session - the stored session.
+ * @param stored - its access token.
+ * @param refresh - its refresh token.
+ * @param force - true to refresh now.
+ * @param config - resolved row config.
+ * @returns the token to send, or undefined when nothing can be refreshed.
+ */
+async function claudeAccess(session, stored, refresh, force, config) {
+  const cached = refresh === undefined ? undefined : cachedAccessToken('claude', refresh)
+  const expiresAt = expiryMs(session)
+  if (!force) {
+    if (cached !== undefined) return cached
+    if (stored !== undefined && (expiresAt === undefined || expiresAt > Date.now() + 60_000)) return stored
+  }
+  if (refresh === undefined) return force ? undefined : stored
+  const body = { grant_type: 'refresh_token', refresh_token: refresh, client_id: CLAUDE_CLIENT_ID }
+  if (typeof session?.scopes === 'string' && session.scopes !== '') body.scope = session.scopes
+  const response = await timedFetch(CLAUDE_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify(body),
+  }, config)
+  if (!response.ok) throw new SubscriptionAuthError(`token refresh HTTP ${response.status}`)
+  const wire = await response.json()
+  const access = firstString(wire?.access_token)
+  if (access === undefined) throw new SubscriptionAuthError('token refresh returned no access_token')
+  rememberAccessToken('claude', refresh, access, Date.now() + (number(wire?.expires_in) ?? 3600) * 1000)
+  return access
+}
+
+/** @param access - Claude access token. @returns the usage request headers. */
+function claudeHeaders(access) {
+  return {
+    authorization: `Bearer ${access}`,
+    'anthropic-beta': 'oauth-2025-04-20',
+    'user-agent': CLAUDE_USER_AGENT,
+    accept: 'application/json',
+  }
+}
+
+/**
+ * Map the Claude usage body to normalized windows. A scoped weekly window
+ * names the model family it applies to.
+ * @param payload - `/api/oauth/usage` body.
+ * @returns normalized windows.
+ */
+function claudeWindows(payload) {
+  const windows = []
+  const limits = Array.isArray(payload?.limits) ? payload.limits : []
+  for (const entry of limits) {
+    if (entry === null || typeof entry !== 'object') continue
+    const percent = number(entry.percent)
+    if (percent === undefined) continue
+    const session = entry.kind === 'session'
+    if (!session && entry.kind !== 'weekly_all' && entry.kind !== 'weekly_scoped') continue
+    const scope = firstString(entry?.scope?.model?.display_name)
+    windows.push({
+      window: session ? '5h' : '7d',
+      label: session ? '5 hours' : 'Weekly',
+      ...(scope === undefined ? {} : { scope }),
+      kind: 'quota',
+      usedPercent: clampPercent(percent),
+      resetsAt: isoMs(entry?.resets_at),
+    })
+  }
+  if (windows.length > 0) return windows
+  for (const [key, window, label, scope] of [
+    ['five_hour', '5h', '5 hours'],
+    ['seven_day', '7d', 'Weekly'],
+    ['seven_day_opus', '7d', 'Weekly', 'Opus'],
+    ['seven_day_sonnet', '7d', 'Weekly', 'Sonnet'],
+  ]) {
+    const bucket = payload?.[key]
+    const utilization = number(bucket?.utilization)
+    if (utilization === undefined) continue
+    windows.push({
+      window,
+      label,
+      ...(scope === undefined ? {} : { scope }),
+      kind: 'quota',
+      usedPercent: clampPercent(utilization),
+      resetsAt: isoMs(bucket?.resets_at),
+    })
+  }
+  return windows
+}
+
+/**
+ * Read the Grok subscription usage.
+ *
+ * The Grok Build CLI's billing proxy reports the shared credit window (usually
+ * weekly) with a ready-made percentage, and older responses report a monthly
+ * credit limit and how much of it was used. The stored access token is
+ * refreshed through the same OAuth client the CLI uses when it has expired.
+ * @param credentials - the optional credentials service.
+ * @param config - resolved row config.
+ * @returns a provider section.
+ */
+async function readGrok(credentials, config) {
+  const provider = { id: 'grok', name: 'Grok', kind: 'quota', windows: [] }
+  const session = await subscriptionSession('grok')
+  const stored = firstString(session?.accessToken, session?.access)
+  const refresh = firstString(session?.refreshToken, session?.refresh)
+  if (stored === undefined && refresh === undefined) return { ...provider, status: 'no-credential' }
+  let access
+  try {
+    access = await grokAccess(session, stored, refresh, false, config)
+  } catch (error) {
+    return subscriptionFailure(provider, error)
+  }
+  if (access === undefined) return { ...provider, status: 'expired' }
+  try {
+    let response = await timedFetch(GROK_BILLING_URL, { headers: grokHeaders(access) }, config)
+    if (response.status === 401 || response.status === 403) {
+      access = await grokAccess(session, stored, refresh, true, config)
+      if (access === undefined) return { ...provider, status: 'expired' }
+      response = await timedFetch(GROK_BILLING_URL, { headers: grokHeaders(access) }, config)
+    }
+    if (!response.ok) return httpFailure(provider, response)
+    const payload = await response.json()
+    const plan = planLabel(firstString(payload?.subscriptionTier)) ?? planLabel(grokTier(access))
+    return {
+      ...provider,
+      status: 'ok',
+      windows: grokWindows(payload),
+      ...(plan === undefined ? {} : { plan }),
+    }
+  } catch (error) {
+    return subscriptionFailure(provider, error)
+  }
+}
+
+/**
+ * Resolve a Grok access token through the stored session's own token endpoint.
+ * @param session - the stored session.
+ * @param stored - its access token.
+ * @param refresh - its refresh token.
+ * @param force - true to refresh now.
+ * @param config - resolved row config.
+ * @returns the token to send, or undefined when nothing can be refreshed.
+ */
+async function grokAccess(session, stored, refresh, force, config) {
+  const cached = refresh === undefined ? undefined : cachedAccessToken('grok', refresh)
+  const expiresAt = expiryMs(session)
+  if (!force) {
+    if (cached !== undefined) return cached
+    if (stored !== undefined && (expiresAt === undefined || expiresAt > Date.now() + 60_000)) return stored
+  }
+  if (refresh === undefined) return force ? undefined : stored
+  const endpoint = firstString(session?.tokenEndpoint, session?.token_endpoint) ?? GROK_DEFAULT_TOKEN_URL
+  const response = await timedFetch(endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: GROK_CLIENT_ID,
+      refresh_token: refresh,
+    }).toString(),
+  }, config)
+  if (!response.ok) throw new SubscriptionAuthError(`token refresh HTTP ${response.status}`)
+  const wire = await response.json()
+  const access = firstString(wire?.access_token)
+  if (access === undefined) throw new SubscriptionAuthError('token refresh returned no access_token')
+  rememberAccessToken('grok', refresh, access, Date.now() + (number(wire?.expires_in) ?? 3600) * 1000)
+  return access
+}
+
+/** @param access - Grok access token. @returns the billing request headers. */
+function grokHeaders(access) {
+  return {
+    authorization: `Bearer ${access}`,
+    'x-xai-token-auth': GROK_TOKEN_AUTH,
+    accept: 'application/json',
+    'user-agent': USER_AGENT,
+  }
+}
+
+/**
+ * Map the Grok billing body to normalized windows. The credits shape carries
+ * its own percentage and period; the legacy shape carries credit counts.
+ * @param payload - billing body.
+ * @returns normalized windows.
+ */
+function grokWindows(payload) {
+  const config = payload?.config
+  if (config === null || typeof config !== 'object') return []
+  const percent = number(config.creditUsagePercent)
+  if (percent !== undefined) {
+    const weekly = config.currentPeriod?.type === 'USAGE_PERIOD_TYPE_WEEKLY'
+    return [{
+      window: weekly ? '7d' : '1mo',
+      label: weekly ? 'Weekly' : 'Monthly',
+      kind: 'quota',
+      usedPercent: clampPercent(percent),
+      resetsAt: isoMs(config.currentPeriod?.end),
+    }]
+  }
+  const limit = number(config.monthlyLimit?.val)
+  if (limit === undefined || limit <= 0) return []
+  const used = number(config.used?.val) ?? 0
+  return [{
+    window: '1mo',
+    label: 'Monthly',
+    kind: 'quota',
+    usedPercent: clampPercent(used / limit * 100),
+    resetsAt: isoMs(config.billingPeriodEnd),
+  }]
+}
+
+/**
+ * @param access - a Grok access token.
+ * @returns the display name of its numeric tier claim, when present.
+ */
+function grokTier(access) {
+  const tier = number(jwtPayload(access)?.tier)
+  return tier === undefined ? undefined : GROK_TIERS[tier] ?? String(tier)
+}
+
+/**
+ * Read the Antigravity shared quota families.
+ *
+ * Antigravity reports one weekly and one 5-hour window per model family
+ * (`Gemini Models`, `Claude and GPT models`, and sometimes `Gemini 4 Argon`),
+ * all through the same `v1internal` backend the Antigravity client uses. Its
+ * access token lives about an hour, so the stored one is refreshed through the
+ * public desktop OAuth client; the refreshed token stays in this process and
+ * the subscription plugin remains the only writer of its document.
+ * @param credentials - the optional credentials service.
+ * @param config - resolved row config.
+ * @returns a provider section.
+ */
+async function readAntigravity(credentials, config) {
+  const provider = { id: 'google-antigravity', name: 'Google Antigravity', kind: 'quota', windows: [] }
+  const session = await subscriptionSession('antigravity')
+  const storedAccess = firstString(session?.accessToken, session?.access)
+  const refresh = firstString(session?.refreshToken, session?.refresh)
+  if (storedAccess === undefined && refresh === undefined) return { ...provider, status: 'no-credential' }
+
+  let access
+  try {
+    access = await antigravityAccess(storedAccess, refresh, expiryMs(session), false, config)
+  } catch (error) {
+    return subscriptionFailure(provider, error)
+  }
+  if (access === undefined) return { ...provider, status: 'expired' }
+
+  try {
+    const project = firstString(session?.projectId, session?.project_id)
+      ?? await antigravityProject(access, config)
+    if (project === undefined) {
+      return { ...provider, status: 'error', message: 'the account has no Cloud AI Companion project' }
+    }
+    let response = await antigravityCall(ANTIGRAVITY_QUOTA_URL, { project }, access, config)
+    // A token the document still calls valid can be revoked server-side; one
+    // forced refresh is the only retry that can change that answer.
+    if (response.status === 401 || response.status === 403) {
+      access = await antigravityAccess(storedAccess, refresh, expiryMs(session), true, config)
+      if (access === undefined) return { ...provider, status: 'expired' }
+      response = await antigravityCall(ANTIGRAVITY_QUOTA_URL, { project }, access, config)
+    }
+    if (!response.ok) return httpFailure(provider, response)
+    const payload = await response.json()
+    const plan = firstString(session?.plan)
+    return {
+      ...provider,
+      status: 'ok',
+      windows: antigravityWindows(payload),
+      ...(plan === undefined ? {} : { plan }),
+    }
+  } catch (error) {
+    return subscriptionFailure(provider, error)
+  }
+}
+
+/**
+ * Resolve an access token for Antigravity: the newest token this process or
+ * the document holds while it has more than a minute left, otherwise a refresh
+ * through the desktop OAuth client.
+ * @param stored - the access token from the subscription document.
+ * @param refresh - its refresh token.
+ * @param expiresAt - the stored token's expiry in ms, when the document records one.
+ * @param force - true to bypass both validities and refresh now.
+ * @param config - resolved row config.
+ * @returns the token to send, or undefined when nothing can be refreshed.
+ */
+async function antigravityAccess(stored, refresh, expiresAt, force, config) {
+  const cached = refresh === undefined ? undefined : cachedAccessToken('antigravity', refresh)
+  if (!force) {
+    if (cached !== undefined) return cached
+    if (stored !== undefined && (expiresAt === undefined || expiresAt > Date.now() + 60_000)) return stored
+  }
+  if (refresh === undefined) return force ? undefined : stored
+  const client = await antigravityClient()
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: refresh,
+    client_id: client.id,
+    client_secret: client.secret,
+  })
+  const response = await timedFetch(ANTIGRAVITY_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  }, config)
+  if (!response.ok) throw new SubscriptionAuthError(`token refresh HTTP ${response.status}`)
+  const wire = await response.json()
+  const access = firstString(wire?.access_token)
+  if (access === undefined) throw new SubscriptionAuthError('token refresh returned no access_token')
+  const lifetime = number(wire?.expires_in) ?? 3600
+  rememberAccessToken('antigravity', refresh, access, Date.now() + lifetime * 1000)
+  return access
+}
+
+/** @param error - any thrown value. @returns the failed provider section. */
+function subscriptionFailure(provider, error) {
+  if (error instanceof SubscriptionAuthError) return { ...provider, status: 'auth', message: error.message }
+  return { ...provider, status: 'error', message: reason(error) }
+}
+
+/** Marks a refresh the account owner has to resolve by signing in again. */
+class SubscriptionAuthError extends Error {}
+
+/**
+ * @param provider - provider id.
+ * @param refresh - the refresh token that produced the access token.
+ * @returns a still-valid cached access token, or undefined.
+ */
+function cachedAccessToken(provider, refresh) {
+  const hit = refreshedTokens.get(`${provider}\u0000${refresh}`)
+  return hit !== undefined && hit.expiresAt > Date.now() + 60_000 ? hit.access : undefined
+}
+
+/**
+ * @param provider - provider id.
+ * @param refresh - the refresh token that produced the access token.
+ * @param access - the fresh access token.
+ * @param expiresAt - its expiry in ms.
+ */
+function rememberAccessToken(provider, refresh, access, expiresAt) {
+  refreshedTokens.set(`${provider}\u0000${refresh}`, { access, expiresAt })
+}
+
+/**
+ * Discover the account's Cloud AI Companion project, for a document that
+ * stored its login without one. Only reads; onboarding stays a sign-in job.
+ * @param access - the access token.
+ * @param config - resolved row config.
+ * @returns the project id, or undefined when the account names none.
+ */
+async function antigravityProject(access, config) {
+  const response = await antigravityCall(
+    ANTIGRAVITY_CODE_ASSIST_URL, { metadata: ANTIGRAVITY_METADATA }, access, config,
+  )
+  if (!response.ok) throw new Error(`loadCodeAssist HTTP ${response.status}`)
+  const payload = await response.json()
+  const project = payload?.cloudaicompanionProject
+  if (typeof project === 'string' && project !== '') return project
+  if (project !== null && typeof project === 'object'
+    && typeof project.id === 'string' && project.id !== '') return project.id
+  return undefined
+}
+
+/**
+ * POST one `v1internal` method.
+ * @param url - exact method URL.
+ * @param body - JSON body.
+ * @param access - the access token.
+ * @param config - resolved row config.
+ * @returns the response.
+ */
+async function antigravityCall(url, body, access, config) {
+  const init = {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${access}`,
+      'content-type': 'application/json',
+      accept: 'application/json',
+      'user-agent': ANTIGRAVITY_USER_AGENT,
+    },
+    body: JSON.stringify(body),
+  }
+  const response = await timedFetch(url, init, config)
+  // The daily endpoint is the shipped one; the production origin is the
+  // documented fallback when the daily one is unavailable.
+  if (![404, 502, 503, 504].includes(response.status)) return response
+  const fallback = url.replace('https://daily-cloudcode-pa.googleapis.com', 'https://cloudcode-pa.googleapis.com')
+  if (fallback === url) return response
+  return timedFetch(fallback, init, config)
+}
+
+/**
+ * Map `/v1internal:retrieveUserQuotaSummary` to normalized windows. Each
+ * group's weekly and 5-hour buckets become rows tagged with the group they
+ * apply to, because the same two windows repeat per model family.
+ * @param payload - quota summary body.
+ * @returns normalized windows.
+ */
+function antigravityWindows(payload) {
+  const groups = Array.isArray(payload?.groups) ? payload.groups : []
+  const windows = []
+  for (const group of groups) {
+    const scope = antigravityScope(firstString(group?.displayName, group?.display_name))
+    const buckets = Array.isArray(group?.buckets) ? group.buckets : []
+    for (const bucket of buckets) {
+      const remaining = fraction(bucket?.remainingFraction ?? bucket?.remaining_fraction)
+      if (remaining === undefined) continue
+      const window = antigravityWindow(bucket)
+      if (window === undefined) continue
+      windows.push({
+        window,
+        label: window === '7d' ? 'Weekly' : '5 hours',
+        scope,
+        kind: 'quota',
+        usedPercent: clampPercent((1 - remaining) * 100),
+        resetsAt: isoMs(bucket?.resetTime ?? bucket?.reset_time),
+      })
+    }
+  }
+  return windows
+}
+
+/**
+ * Classify one Antigravity bucket by the duration it names, not by position.
+ * @param bucket - one `groups[].buckets[]` entry.
+ * @returns `7d`, `5h`, or undefined for a window this panel cannot place.
+ */
+function antigravityWindow(bucket) {
+  const hint = [
+    bucket?.window, bucket?.displayName, bucket?.display_name, bucket?.description,
+  ].filter((value) => typeof value === 'string').join(' ').toLowerCase()
+  if (/week|7[ _-]?(?:day|d)\b/.test(hint)) return '7d'
+  if (/(?:5|five)[ _-]?(?:hour|h)\b/.test(hint)) return '5h'
+  return undefined
+}
+
+/**
+ * Normalize a group name to one of the account-wide families. An unknown
+ * group keeps its own name so a new family still reaches the panel.
+ * @param name - group display name.
+ * @returns the scope label.
+ */
+function antigravityScope(name) {
+  if (name === undefined) return undefined
+  const known = ANTIGRAVITY_SCOPES.find((scope) => scope.toLowerCase() === name.toLowerCase())
+  return known ?? name
+}
+
+/** @param value - a reported remaining share. @returns 0..1, or undefined. */
+function fraction(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value >= 0 && value <= 1 ? value : undefined
+  if (typeof value === 'string' && value.trim() !== '') {
+    const trimmed = value.trim()
+    const parsed = trimmed.endsWith('%') ? Number(trimmed.slice(0, -1)) / 100 : Number(trimmed)
+    return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : undefined
+  }
+  return undefined
+}
+
+/**
+ * Read the Codex plan windows from a stored login.
+ *
+ * Two stores can hold one: the subscription plugin's document — the login the
+ * Settings → Subscriptions page creates — and, as a fallback, the credential
+ * record the Models page's pi-ai route writes. The first grant that has not
+ * expired wins; an expired one is never sent, because the provider answers
+ * 401 and would hide the real reason.
  * @param credentials - the optional credentials service.
  * @param config - resolved row config.
  * @returns a provider section.
  */
 async function readCodex(credentials, config) {
   const provider = { id: 'openai-codex', name: 'OpenAI Codex', kind: 'quota', windows: [] }
-  if (credentials === undefined) return { ...provider, status: 'no-credential' }
-  let record
-  try {
-    record = await credentials.readRecord('llm-pi-ai/openai-codex')
-  } catch {
-    record = undefined
+  const session = await subscriptionSession('codex')
+  const sessionAccess = firstString(session?.accessToken, session?.access, session?.access_token)
+  const grant = await grantPayload(credentials, 'llm-pi-ai/openai-codex')
+  const grantAccess = firstString(grant?.accessToken, grant?.access, grant?.access_token)
+  const candidates = []
+  if (sessionAccess !== undefined) {
+    candidates.push({
+      source: 'subscriptions',
+      access: sessionAccess,
+      accountId: firstString(session?.accountId, session?.account_id),
+      plan: planLabel(firstString(session?.planType)),
+      expiresAt: expiryMs(session),
+    })
   }
-  const grant = record?.kind === 'grant' ? record.payload : undefined
-  const access = firstString(grant?.accessToken, grant?.access, grant?.access_token)
-  if (access === undefined) return { ...provider, status: 'no-credential' }
+  if (grantAccess !== undefined) {
+    candidates.push({
+      source: 'models',
+      access: grantAccess,
+      accountId: firstString(grant?.accountId, grant?.account_id),
+      expiresAt: expiryMs(grant),
+    })
+  }
+  if (candidates.length === 0) return { ...provider, status: 'no-credential' }
+  const now = Date.now()
+  const live = candidates.find((candidate) => candidate.expiresAt === undefined || candidate.expiresAt > now)
+  if (live === undefined) return { ...provider, status: 'expired', source: candidates[0].source }
 
-  const expiresAt = expiryMs(grant)
-  if (expiresAt !== undefined && expiresAt <= Date.now()) {
-    return { ...provider, status: 'expired' }
-  }
-  const accountId = firstString(grant?.accountId, grant?.account_id)
-    ?? jwtClaim(access, 'https://api.openai.com/auth', 'chatgpt_account_id')
-  const headers = { accept: 'application/json', authorization: `Bearer ${access}`, 'user-agent': USER_AGENT }
+  const accountId = live.accountId ?? jwtClaim(live.access, 'https://api.openai.com/auth', 'chatgpt_account_id')
+  const headers = { accept: 'application/json', authorization: `Bearer ${live.access}`, 'user-agent': USER_AGENT }
   if (accountId !== undefined) headers['chatgpt-account-id'] = accountId
   try {
     const response = await timedFetch(CODEX_USAGE_URL, { headers }, config)
-    if (!response.ok) return httpFailure(provider, response)
+    if (!response.ok) return { ...httpFailure(provider, response), source: live.source }
     const payload = await response.json()
-    const windows = codexWindows(payload)
-    const plan = typeof payload?.plan_type === 'string' && payload.plan_type !== '' ? payload.plan_type : undefined
+    const plan = planLabel(firstString(payload?.plan_type)) ?? live.plan
     return {
       ...provider,
       status: 'ok',
-      windows,
+      windows: codexWindows(payload),
+      source: live.source,
       ...(plan === undefined ? {} : { plan }),
     }
   } catch (error) {
-    return { ...provider, status: 'error', message: reason(error) }
+    return { ...provider, status: 'error', message: reason(error), source: live.source }
   }
 }
 
@@ -440,6 +1346,22 @@ function expiryMs(grant) {
 }
 
 /**
+ * Decode the payload of a JWT-shaped access token, without verifying it.
+ * @param token - the access token.
+ * @returns its payload object, or undefined when the token is not a JWT.
+ */
+function jwtPayload(token) {
+  const parts = token.split('.')
+  if (parts.length !== 3) return undefined
+  try {
+    const json = JSON.parse(Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'))
+    return json !== null && typeof json === 'object' ? json : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Read one claim from a JWT-shaped access token.
  * @param token - the access token.
  * @param claim - claim namespace.
@@ -447,15 +1369,8 @@ function expiryMs(grant) {
  * @returns the string member, when present.
  */
 function jwtClaim(token, claim, member) {
-  const parts = token.split('.')
-  if (parts.length !== 3) return undefined
-  try {
-    const json = JSON.parse(Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'))
-    const value = json?.[claim]?.[member]
-    return typeof value === 'string' && value !== '' ? value : undefined
-  } catch {
-    return undefined
-  }
+  const value = jwtPayload(token)?.[claim]?.[member]
+  return typeof value === 'string' && value !== '' ? value : undefined
 }
 
 /**
