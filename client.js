@@ -51,6 +51,9 @@ window.__ModuleLoader__.load({
       hintSubscriptionAuth: 'The sign-in was rejected. Sign in again under Settings → Subscriptions.',
       hintExpired: 'Session expired. Sign in again under Settings → Models.',
       hintSubscriptionExpired: 'Session expired. Sign in again under Settings → Subscriptions.',
+      hintCli: "Sign in with the provider's own CLI on this machine.",
+      hintCliExpired: "Session expired. Sign in again with the provider's CLI.",
+      hintCliAuth: "The CLI sign-in was rejected. Sign in again with the provider's CLI.",
       window5h: '5 hours',
       window7d: 'Weekly',
       window1mo: 'Monthly',
@@ -122,6 +125,9 @@ window.__ModuleLoader__.load({
       hintSubscriptionAuth: 'Вход отклонён. Войдите заново в Настройки → Подписки.',
       hintExpired: 'Сеанс истёк. Войдите заново в Настройки → Модели.',
       hintSubscriptionExpired: 'Сеанс истёк. Войдите заново в Настройки → Подписки.',
+      hintCli: 'Войдите через собственный CLI провайдера на этой машине.',
+      hintCliExpired: 'Сеанс истёк. Войдите заново через CLI провайдера.',
+      hintCliAuth: 'Вход через CLI отклонён. Войдите заново через CLI провайдера.',
       window5h: '5 часов',
       window7d: 'Неделя',
       window1mo: 'Месяц',
@@ -270,6 +276,25 @@ window.__ModuleLoader__.load({
       if (section.id === 'claude' || section.id === 'grok' || section.id === 'google-antigravity') return true
       if (section.id === 'openai-codex') return section.source !== 'models'
       return false
+    }
+
+    /**
+     * Where a provider's credential is owned, which decides the hint an
+     * unlinked card shows: Settings → Subscriptions, an API key on the Models
+     * page, or the provider's own CLI and key file on this machine.
+     * @param section - provider section.
+     * @returns 'subscription', 'cli', or 'key'.
+     */
+    function credentialClass(section) {
+      if (section.id === 'cursor' || section.id === 'factory') return 'cli'
+      return subscriptionProvider(section) ? 'subscription' : 'key'
+    }
+
+    /** Hint keys per credential class, for a card that is unlinked, expired, or rejected. */
+    const CREDENTIAL_HINTS = {
+      subscription: ['hintSubscription', 'hintSubscriptionExpired', 'hintSubscriptionAuth'],
+      cli: ['hintCli', 'hintCliExpired', 'hintCliAuth'],
+      key: ['hintKey', 'hintExpired', 'hintAuth'],
     }
 
     /** @param t - translator. @param window - window descriptor. @returns its localized label. */
@@ -444,12 +469,13 @@ window.__ModuleLoader__.load({
       const balances = Array.isArray(section.balances) ? section.balances : []
       let note = null
       let noteTone = 'muted'
+      const hints = CREDENTIAL_HINTS[credentialClass(section)]
       if (section.status === 'no-credential') {
-        note = subscriptionProvider(section) ? t('hintSubscription') : t('hintKey')
+        note = t(hints[0])
       } else if (section.status === 'expired') {
-        note = subscriptionProvider(section) ? t('hintSubscriptionExpired') : t('hintExpired')
+        note = t(hints[1])
       } else if (section.status === 'auth') {
-        note = subscriptionProvider(section) ? t('hintSubscriptionAuth') : t('hintAuth')
+        note = t(hints[2])
         noteTone = 'error'
       } else if (section.status === 'error') {
         note = section.message === undefined ? t('statusError') : `${t('statusError')}: ${section.message}`

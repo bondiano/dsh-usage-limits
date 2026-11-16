@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Usage limits",
-    "description": "Adds a Limits entry to the left sidebar that opens a panel with every limit this machine can observe: OpenCode Go, Z.AI, OpenAI Codex, Claude, Grok, GitHub Copilot, Google Antigravity, and DeepSeek quota windows and balances, the default model's context and output capacity, and the deployment's subagent, image, and automation limits. Subscription logins are read from the subscription plugin, so ChatGPT, Claude, Grok, GitHub Copilot, and Google AI plans show their windows without an API key. Each provider card loads, fails, retries, and refreshes on its own, so one slow provider never holds the others."
+    "description": "Adds a Limits entry to the left sidebar that opens a panel with every limit this machine can observe: OpenCode Go, Z.AI, OpenAI Codex, Claude, Grok, GitHub Copilot, Google Antigravity, Cursor, Factory (Droid), and DeepSeek quota windows and balances, the default model's context and output capacity, and the deployment's subagent, image, and automation limits. Subscription logins are read from the subscription plugin, so ChatGPT, Claude, Grok, GitHub Copilot, and Google AI plans show their windows without an API key. Each provider card loads, fails, retries, and refreshes on its own, so one slow provider never holds the others."
   }
 }

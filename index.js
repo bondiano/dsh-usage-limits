@@ -26,6 +26,7 @@ const ROUTE = '/plugin-api/usage-limits/limits'
 const PROVIDER_IDS = Object.freeze([
   'opencode-go', 'zai', 'deepseek',
   'openai-codex', 'claude', 'grok', 'github-copilot', 'google-antigravity',
+  'cursor', 'factory',
 ])
 
 /** Provider endpoints, all account-level and read-only. */
@@ -41,6 +42,8 @@ const CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 const CLAUDE_TOKEN_URL = 'https://claude.ai/v1/oauth/token'
 const GROK_BILLING_URL = 'https://cli-chat-proxy.grok.com/v1/billing?format=credits'
 const GROK_DEFAULT_TOKEN_URL = 'https://auth.x.ai/oauth2/token'
+const CURSOR_USAGE_URL = 'https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage'
+const FACTORY_LIMITS_URL = 'https://api.factory.ai/api/billing/limits'
 
 /** Public OAuth client ids of the Claude Code and Grok CLI apps. */
 const CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
@@ -268,6 +271,8 @@ async function readProviderSection(ctx, config, id) {
     case 'grok': return readGrok(credentials, config)
     case 'github-copilot': return readCopilot(credentials, config)
     case 'google-antigravity': return readAntigravity(credentials, config)
+    case 'cursor': return readCursor(keyReader(credentials), config)
+    case 'factory': return readFactory(keyReader(credentials), config)
     default: return undefined
   }
 }
@@ -1225,6 +1230,160 @@ function antigravityScope(name) {
   if (name === undefined) return undefined
   const known = ANTIGRAVITY_SCOPES.find((scope) => scope.toLowerCase() === name.toLowerCase())
   return known ?? name
+}
+
+/**
+ * Read the Cursor plan windows.
+ *
+ * Cursor's dashboard endpoint is a Connect-RPC method that accepts the session
+ * the local Cursor CLI stores; the minted model-call key does not work there.
+ * @param readKey - credential reader.
+ * @param config - resolved row config.
+ * @returns a provider section.
+ */
+async function readCursor(readKey, config) {
+  const provider = { id: 'cursor', name: 'Cursor', kind: 'quota', windows: [] }
+  const credential = await readKey('CURSOR_AUTH_TOKEN') ?? await cursorAuthFileToken()
+  if (credential === undefined) return { ...provider, status: 'no-credential', secret: 'CURSOR_AUTH_TOKEN' }
+  try {
+    const response = await timedFetch(CURSOR_USAGE_URL, {
+      method: 'POST',
+      body: '{}',
+      headers: {
+        accept: 'application/json',
+        authorization: `Bearer ${credential}`,
+        'connect-protocol-version': '1',
+        'content-type': 'application/json',
+        'user-agent': USER_AGENT,
+      },
+    }, config)
+    if (!response.ok) return httpFailure(provider, response, 'CURSOR_AUTH_TOKEN')
+    const payload = await response.json()
+    const usage = payload?.planUsage
+    const windows = []
+    if (usage !== null && typeof usage === 'object') {
+      const resetsAt = timestamp(payload?.billingCycleEnd)
+      for (const [window, label, field] of [
+        ['total', 'Total', 'totalPercentUsed'],
+        ['auto', 'Auto', 'autoPercentUsed'],
+        ['api', 'API', 'apiPercentUsed'],
+      ]) {
+        const percent = number(usage[field])
+        if (percent === undefined) continue
+        windows.push({ window, label, kind: 'quota', usedPercent: clampPercent(percent), resetsAt })
+      }
+    }
+    return { ...provider, status: 'ok', windows }
+  } catch (error) {
+    return { ...provider, status: 'error', message: reason(error) }
+  }
+}
+
+/**
+ * Resolve the Cursor CLI session from its auth file.
+ * The CLI's Keychain copy is not read: the panel polls in the background, and a
+ * Keychain prompt must not appear on a timer. The file is written by `agent login`.
+ * @returns the access token, or undefined.
+ */
+async function cursorAuthFileToken() {
+  const configured = process.env?.XDG_CONFIG_HOME?.trim()
+  const configHome = configured !== undefined && configured !== '' ? configured : join(homedir(), '.config')
+  for (const path of [join(homedir(), '.cursor', 'auth.json'), join(configHome, 'cursor', 'auth.json')]) {
+    try {
+      const parsed = JSON.parse(await readFile(path, 'utf8'))
+      const token = firstString(parsed?.accessToken)
+      if (token !== undefined) return token
+    } catch {
+      // Try the next location.
+    }
+  }
+  return undefined
+}
+
+/**
+ * Read the Factory (Droid) rate-limit windows.
+ *
+ * The billing endpoint reports one pool of 5-hour, weekly, and monthly windows
+ * for the paid models and, when the account has it, a second pool for the free
+ * Droid Core models. Only a Factory API key authenticates here; the browser
+ * session the web app uses is not read.
+ * @param readKey - credential reader.
+ * @param config - resolved row config.
+ * @returns a provider section.
+ */
+async function readFactory(readKey, config) {
+  const provider = { id: 'factory', name: 'Factory', kind: 'quota', windows: [] }
+  const credential = await readKey('FACTORY_API_KEY') ?? await factoryEnvKey()
+  if (credential === undefined) return { ...provider, status: 'no-credential', secret: 'FACTORY_API_KEY' }
+  try {
+    const response = await timedFetch(FACTORY_LIMITS_URL, {
+      headers: {
+        accept: 'application/json',
+        authorization: `Bearer ${credential}`,
+        origin: 'https://app.factory.ai',
+        referer: 'https://app.factory.ai/',
+        'user-agent': USER_AGENT,
+        'x-factory-client': 'web-app',
+      },
+    }, config)
+    if (!response.ok) return httpFailure(provider, response, 'FACTORY_API_KEY')
+    const payload = await response.json()
+    const limits = payload?.limits
+    const windows = []
+    if (limits !== null && typeof limits === 'object') {
+      for (const [pool, scope] of [['standard', undefined], ['core', 'Core']]) {
+        const entry = limits[pool]
+        if (entry === null || typeof entry !== 'object') continue
+        for (const [window, label, field] of [['5h', '5 hours', 'fiveHour'], ['7d', 'Weekly', 'weekly'], ['1mo', 'Monthly', 'monthly']]) {
+          const measured = factoryWindow(entry[field])
+          if (measured === undefined) continue
+          windows.push({ window, label, kind: 'quota', ...(scope === undefined ? {} : { scope }), ...measured })
+        }
+      }
+    }
+    return { ...provider, status: 'ok', windows }
+  } catch (error) {
+    return { ...provider, status: 'error', message: reason(error) }
+  }
+}
+
+/**
+ * Map one Factory billing window. Factory leaves a stale percentage behind
+ * after a short window lapses, so an expired window reads as untouched.
+ * @param raw - one `limits.<pool>.<window>` object.
+ * @returns the used share and reset, or undefined for a window without a measurement.
+ */
+function factoryWindow(raw) {
+  if (raw === null || typeof raw !== 'object') return undefined
+  const percent = number(raw.usedPercent)
+  if (percent === undefined) return undefined
+  const seconds = number(raw.secondsRemaining)
+  const end = timestamp(raw.windowEnd) ?? isoMs(raw.windowEnd)
+  const resetsAt = seconds !== undefined && seconds > 0
+    ? Date.now() + seconds * 1000
+    : end !== undefined && end > Date.now() ? end : undefined
+  const expired = resetsAt === undefined && end !== undefined
+  return { usedPercent: expired ? 0 : clampPercent(percent), ...(resetsAt === undefined ? {} : { resetsAt }) }
+}
+
+/**
+ * Read `FACTORY_API_KEY` from the CLI's own env file.
+ * @returns the key, or undefined when the file is absent or names none.
+ */
+async function factoryEnvKey() {
+  let text
+  try {
+    text = await readFile(join(homedir(), '.factory', '.env'), 'utf8')
+  } catch {
+    return undefined
+  }
+  for (const line of text.split('\n')) {
+    const match = /^\s*(?:export\s+)?FACTORY_API_KEY\s*=\s*(.*)$/.exec(line)
+    if (match === null) continue
+    const value = match[1].trim().replace(/^(['"])([\s\S]*)\1$/, '$2')
+    if (value !== '') return value
+  }
+  return undefined
 }
 
 /** @param value - a reported remaining share. @returns 0..1, or undefined. */
