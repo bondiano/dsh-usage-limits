@@ -16,7 +16,8 @@
     "cordis.patch.yml",
     "locale/*.json",
     "README.md",
-    "icon.svg"
+    "icon.svg",
+    "web-route-auth.mjs"
   ],
   "dsh": {
     "bundle": {
@@ -30,5 +31,13 @@
         "@deepseek-ai/dsh-client-ui-layout"
       ]
     }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bondiano/dsh-usage-limits.git"
+  },
+  "homepage": "https://github.com/bondiano/dsh-usage-limits#readme",
+  "bugs": {
+    "url": "https://github.com/bondiano/dsh-usage-limits/issues"
   }
 }

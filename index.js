@@ -11,6 +11,8 @@
  * @module @local/dsh-usage-limits
  */
 
+import { authenticatedWebServer } from './web-route-auth.mjs'
+
 import { readFile, readdir } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
@@ -166,7 +168,7 @@ export function apply(ctx, config = {}) {
     return poll
   }
 
-  ctx.effect(() => ctx.webServer.register({
+  ctx.effect(() => authenticatedWebServer(ctx, ctx.webServer).register({
     kind: 'exact',
     path: ROUTE,
     resource: async (request) => {
