@@ -610,7 +610,7 @@ export default function createUsageLimitsClient(require: (id: string) => unknown
 
   /**
    * One provider card: its own request, loader, retry, and polling cadence.
-   * The card state is the `usageBlock` machine state (lib/usage.machine.mjs):
+   * The card state is the `usageBlock` machine state (lib/usage.machine.ts):
    * every state change is a machine transition, so a sequence the panel cannot
    * render fails loudly instead of silently inventing one.
    */

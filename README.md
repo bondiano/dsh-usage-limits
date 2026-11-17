@@ -70,9 +70,9 @@ token reaches the browser. The route answers only a loopback `Host` header and
 a same-origin page, so it stays unavailable when the GUI is served on a LAN
 address.
 
-The Client half is built: `npm run build` bundles `src/client.js` (which owns
-the `usageBlock` card machine from `lib/usage.machine.mjs`) into the committed
-`client.js`; edit the source, never the generated file.
+The Client half is built: `npm run build` bundles `src/client.ts` (which owns
+the `usageBlock` card machine from `lib/usage.machine.ts`) into the committed
+`dist/client.js`; edit the source, never the generated file.
 
 ## Configuration
 
