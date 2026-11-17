@@ -22,11 +22,11 @@
     "locale/*.json",
     "README.md",
     "icon.svg",
-    "scripts/build-client.mjs",
+    "scripts/build-client.ts",
     "src/client.ts"
   ],
   "scripts": {
-    "build": "tsc && node scripts/build-client.mjs",
+    "build": "tsc && node scripts/build-client.ts",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test dist/test/*.test.js",
     "check": "npm run typecheck && npm test"
