@@ -1,13 +1,26 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Readable } from 'node:stream'
-import { authenticatedWebServer } from '../web-route-auth.mjs'
+import { authenticatedWebServer, type NativeConnection } from '../web-route-auth.js'
 
 const lan = '192.168.1.6:3344'
 const local = '127.0.0.1:3344'
 
-function fixture({ connection, host = '127.0.0.1', logger } = {}) {
-  const routes = []
+/** Fixture options: the ctx doubles and the listener host to wrap. */
+interface FixtureOptions {
+  connection?: NativeConnection
+  host?: string
+  logger?: { warn?(...args: unknown[]): void }
+}
+
+/** Route shape the wrapped registrations the fixture captures. */
+interface RegisteredRoute {
+  handler(...args: unknown[]): unknown
+  resource(...args: unknown[]): Response | Promise<Response>
+}
+
+function fixture({ connection, host = '127.0.0.1', logger }: FixtureOptions = {}) {
+  const routes: RegisteredRoute[] = []
   class Server {
     #host = host
     get host() { return this.#host }
@@ -20,7 +33,7 @@ function fixture({ connection, host = '127.0.0.1', logger } = {}) {
 }
 
 // Model the native synchronous admission contract; assertions verify it receives original headers.
-function nativeConnection(seen = []) {
+function nativeConnection(seen: Record<string, string>[] = []) {
   return {
     allowsRemoteAuthorities: true,
     requestRejection(request) {
@@ -34,7 +47,16 @@ function nativeConnection(seen = []) {
   }
 }
 
-function response() {
+/** Response double the handler assertions inspect. */
+interface ResponseDouble {
+  status?: number
+  headers?: Record<string, string>
+  body?: string
+  writeHead(status: number, headers: Record<string, string>): void
+  end(body: string): void
+}
+
+function response(): ResponseDouble {
   return {
     writeHead(status, headers) { this.status = status; this.headers = headers },
     end(body) { this.body = body },
@@ -62,9 +84,9 @@ test('wrong Origin and cross-site requests are rejected before normalization', (
 })
 
 test('authenticated LAN handler receives legacy loopback headers and a functioning stream', async () => {
-  const seen = []
+  const seen: Record<string, string>[] = []
   const { facade, routes, server } = fixture({ connection: nativeConnection(seen) })
-  const req = Readable.from(['body'])
+  const req = Readable.from(['body']) as Readable & { headers: Record<string, string> }
   req.headers = { host: lan, origin: `http://${lan}`, cookie: 'authenticated', 'sec-fetch-site': 'same-origin' }
   facade.register({ handler: async incoming => {
     assert.equal(incoming.headers.host, local)
@@ -83,7 +105,7 @@ test('authenticated LAN handler receives legacy loopback headers and a functioni
 })
 
 test('Fetch resources reject unauthenticated and cross-origin requests and adapt admitted LAN', async () => {
-  const seen = []
+  const seen: Record<string, string>[] = []
   const { facade, routes } = fixture({ connection: nativeConnection(seen) })
   let calls = 0
   facade.register({ resource: request => {
@@ -102,7 +124,7 @@ test('Fetch resources reject unauthenticated and cross-origin requests and adapt
   const original = new Request(`http://${lan}/private`, { headers: { host: lan, cookie: 'authenticated', origin: `http://${lan}` } })
   assert.equal(await (await routes[0].resource(original)).text(), 'private')
   assert.equal(original.headers.get('host'), lan)
-  assert.equal(seen.at(-1).host, lan)
+  assert.equal(seen.at(-1)?.host, lan)
   assert.equal(calls, 1)
 })
 
@@ -145,7 +167,7 @@ test('private-only desktop behavior retains original requests and route disposer
 })
 
 test('native admission errors fail closed', () => {
-  const warnings = []
+  const warnings: unknown[][] = []
   const { facade, routes } = fixture({
     connection: { allowsRemoteAuthorities: true, requestRejection() { throw new Error('sensitive detail') } },
     logger: { warn: (...args) => warnings.push(args) },

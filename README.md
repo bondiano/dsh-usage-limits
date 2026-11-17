@@ -70,6 +70,10 @@ token reaches the browser. The route answers only a loopback `Host` header and
 a same-origin page, so it stays unavailable when the GUI is served on a LAN
 address.
 
+The Client half is built: `npm run build` bundles `src/client.js` (which owns
+the `usageBlock` card machine from `lib/usage.machine.mjs`) into the committed
+`client.js`; edit the source, never the generated file.
+
 ## Configuration
 
 Set these fields on the bundle's row in `cordis.patch.yml`:

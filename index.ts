@@ -11,13 +11,71 @@
  * @module @local/dsh-usage-limits
  */
 
-import { authenticatedWebServer } from './web-route-auth.mjs'
+import { authenticatedWebServer, type NativeConnection, type WebServer } from './web-route-auth.js'
 
 import { readFile, readdir } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+
+/**
+ * Cordis Host context slice this plugin uses: the injected web server, the
+ * route effect hook, and the optional services `service` reads below.
+ * Unlisted members are not touched.
+ */
+export interface HostContext {
+  webServer: WebServer
+  get(name: 'connection'): NativeConnection | undefined
+  get(name: string): unknown
+  effect(callback: () => unknown, label?: string): unknown
+  logger?: { warn?(message: string): void }
+}
+
+/** Row config keys the plugin row may set; every key is optional. */
+interface RowConfig {
+  refreshSeconds?: number
+  requestTimeoutMs?: number
+}
+
+/** One normalized quota-window row every provider section emits. */
+interface UsageWindow {
+  window: string
+  label?: string
+  kind?: string
+  scope?: string
+  usedPercent?: number
+  used?: number
+  limit?: number
+  resetsAt?: number
+  exhausted?: boolean
+}
+
+/** One provider balance row. */
+interface BalanceRow {
+  currency: string
+  total?: number
+  granted?: number
+  toppedUp?: number
+}
+
+/** One `quota_snapshots` entry the Copilot account body carries. */
+interface CopilotSnapshot {
+  unlimited?: boolean
+  entitlement?: unknown
+  remaining?: unknown
+  percent_remaining?: unknown
+  quota_reset_at?: unknown
+}
+
+/** One usable Codex grant candidate, from the subscriptions document or the Models-page record. */
+interface CodexCandidate {
+  source: string
+  access: string
+  accountId?: string
+  plan?: string
+  expiresAt?: number
+}
 
 /** Route the Client half reads; same origin, GET/HEAD only. */
 const ROUTE = '/plugin-api/usage-limits/limits'
@@ -138,7 +196,7 @@ export const inject = ['webServer']
  * @param ctx - Host plugin context carrying `webServer` and the optional services read below.
  * @param config - row config: `refreshSeconds`, `requestTimeoutMs`.
  */
-export function apply(ctx, config = {}) {
+export function apply(ctx: HostContext, config: RowConfig = {}) {
   const resolved = {
     refreshSeconds: positive(config?.refreshSeconds, DEFAULTS.refreshSeconds),
     requestTimeoutMs: positive(config?.requestTimeoutMs, DEFAULTS.requestTimeoutMs),
@@ -375,7 +433,7 @@ async function resolveAntigravityClient() {
     return { id: configuredId, secret: configuredSecret }
   }
   const profiles = join(harnessHome(), 'profiles')
-  const profileDirs = []
+  const profileDirs: string[] = []
   const active = process.env?.DSH_PROFILE_DIR?.trim()
   if (active !== undefined && active !== '') profileDirs.push(active)
   try {
@@ -477,12 +535,12 @@ async function readOpencodeGo(readKey, config) {
     if (!response.ok) return httpFailure(provider, response, 'OPENCODE_GO_API_KEY')
     const payload = await response.json()
     const usage = payload?.usage ?? {}
-    const windows = []
+    const windows: UsageWindow[] = []
     for (const [key, meta] of [
       ['rolling', { id: '5h', label: '5 hours' }],
       ['weekly', { id: '7d', label: 'Weekly' }],
       ['monthly', { id: '1mo', label: 'Monthly' }],
-    ]) {
+    ] as const) {
       const window = usage[key]
       if (!window || typeof window.percent !== 'number') continue
       windows.push({
@@ -520,7 +578,7 @@ async function readZai(readKey, config) {
       return { ...provider, status: 'error', message: typeof payload.msg === 'string' ? payload.msg : 'Z.AI refused the quota request' }
     }
     const limits = Array.isArray(payload?.data?.limits) ? payload.data.limits : []
-    const windows = []
+    const windows: UsageWindow[] = []
     for (const item of limits) {
       const percent = number(item?.percentage)
       if (percent === undefined) continue
@@ -594,7 +652,7 @@ async function readDeepseek(readKey, config) {
     if (!response.ok) return httpFailure(provider, response, 'DEEPSEEK_API_KEY')
     const payload = await response.json()
     const infos = Array.isArray(payload?.balance_infos) ? payload.balance_infos : []
-    const balances = []
+    const balances: BalanceRow[] = []
     for (const info of infos) {
       if (!info || typeof info.currency !== 'string') continue
       balances.push({
@@ -664,10 +722,10 @@ async function readCopilot(credentials, config) {
  * @returns normalized windows.
  */
 function copilotWindows(payload) {
-  const windows = []
+  const windows: UsageWindow[] = []
   const seen = new Set()
   const resetAt = isoMs(payload?.quota_reset_date_utc) ?? dateOnlyMs(payload?.quota_reset_date)
-  const snapshots = payload?.quota_snapshots
+  const snapshots: Record<string, CopilotSnapshot | null> | undefined = payload?.quota_snapshots
   if (snapshots !== null && typeof snapshots === 'object') {
     for (const [id, snapshot] of Object.entries(snapshots)) {
       if (snapshot === null || typeof snapshot !== 'object' || snapshot.unlimited === true) continue
@@ -697,8 +755,8 @@ function copilotWindows(payload) {
       })
     }
   }
-  const monthly = payload?.monthly_quotas
-  const limited = payload?.limited_user_quotas
+  const monthly: Record<string, unknown> | undefined = payload?.monthly_quotas
+  const limited: Record<string, unknown> | undefined = payload?.limited_user_quotas
   if (monthly !== null && typeof monthly === 'object'
     && limited !== null && typeof limited === 'object') {
     for (const [id, total] of Object.entries(monthly)) {
@@ -800,7 +858,7 @@ async function claudeAccess(session, stored, refresh, force, config) {
     if (stored !== undefined && (expiresAt === undefined || expiresAt > Date.now() + 60_000)) return stored
   }
   if (refresh === undefined) return force ? undefined : stored
-  const body = { grant_type: 'refresh_token', refresh_token: refresh, client_id: CLAUDE_CLIENT_ID }
+  const body: { grant_type: string; refresh_token: string; client_id: string; scope?: string } = { grant_type: 'refresh_token', refresh_token: refresh, client_id: CLAUDE_CLIENT_ID }
   if (typeof session?.scopes === 'string' && session.scopes !== '') body.scope = session.scopes
   const response = await timedFetch(CLAUDE_TOKEN_URL, {
     method: 'POST',
@@ -832,7 +890,7 @@ function claudeHeaders(access) {
  * @returns normalized windows.
  */
 function claudeWindows(payload) {
-  const windows = []
+  const windows: UsageWindow[] = []
   const limits = Array.isArray(payload?.limits) ? payload.limits : []
   for (const entry of limits) {
     if (entry === null || typeof entry !== 'object') continue
@@ -1184,7 +1242,7 @@ async function antigravityCall(url, body, access, config) {
  */
 function antigravityWindows(payload) {
   const groups = Array.isArray(payload?.groups) ? payload.groups : []
-  const windows = []
+  const windows: UsageWindow[] = []
   for (const group of groups) {
     const scope = antigravityScope(firstString(group?.displayName, group?.display_name))
     const buckets = Array.isArray(group?.buckets) ? group.buckets : []
@@ -1260,7 +1318,7 @@ async function readCursor(readKey, config) {
     if (!response.ok) return httpFailure(provider, response, 'CURSOR_AUTH_TOKEN')
     const payload = await response.json()
     const usage = payload?.planUsage
-    const windows = []
+    const windows: UsageWindow[] = []
     if (usage !== null && typeof usage === 'object') {
       const resetsAt = timestamp(payload?.billingCycleEnd)
       for (const [window, label, field] of [
@@ -1329,9 +1387,9 @@ async function readFactory(readKey, config) {
     if (!response.ok) return httpFailure(provider, response, 'FACTORY_API_KEY')
     const payload = await response.json()
     const limits = payload?.limits
-    const windows = []
+    const windows: UsageWindow[] = []
     if (limits !== null && typeof limits === 'object') {
-      for (const [pool, scope] of [['standard', undefined], ['core', 'Core']]) {
+      for (const [pool, scope] of [['standard', undefined], ['core', 'Core']] as [string, string | undefined][]) {
         const entry = limits[pool]
         if (entry === null || typeof entry !== 'object') continue
         for (const [window, label, field] of [['5h', '5 hours', 'fiveHour'], ['7d', 'Weekly', 'weekly'], ['1mo', 'Monthly', 'monthly']]) {
@@ -1415,7 +1473,7 @@ async function readCodex(credentials, config) {
   const sessionAccess = firstString(session?.accessToken, session?.access, session?.access_token)
   const grant = await grantPayload(credentials, 'llm-pi-ai/openai-codex')
   const grantAccess = firstString(grant?.accessToken, grant?.access, grant?.access_token)
-  const candidates = []
+  const candidates: CodexCandidate[] = []
   if (sessionAccess !== undefined) {
     candidates.push({
       source: 'subscriptions',
@@ -1439,7 +1497,7 @@ async function readCodex(credentials, config) {
   if (live === undefined) return { ...provider, status: 'expired', source: candidates[0].source }
 
   const accountId = live.accountId ?? jwtClaim(live.access, 'https://api.openai.com/auth', 'chatgpt_account_id')
-  const headers = { accept: 'application/json', authorization: `Bearer ${live.access}`, 'user-agent': USER_AGENT }
+  const headers: Record<string, string> = { accept: 'application/json', authorization: `Bearer ${live.access}`, 'user-agent': USER_AGENT }
   if (accountId !== undefined) headers['chatgpt-account-id'] = accountId
   try {
     const response = await timedFetch(CODEX_USAGE_URL, { headers }, config)
@@ -1460,7 +1518,7 @@ async function readCodex(credentials, config) {
 
 /** @param payload - `/wham/usage` body. @returns normalized plan windows. */
 function codexWindows(payload) {
-  const windows = []
+  const windows: UsageWindow[] = []
   const rateLimit = payload?.rate_limit
   appendWindow(windows, rateLimit?.primary_window, '5h', '5 hours')
   appendWindow(windows, rateLimit?.secondary_window, '7d', 'Weekly')
@@ -1534,6 +1592,17 @@ function jwtClaim(token, claim, member) {
   return typeof value === 'string' && value !== '' ? value : undefined
 }
 
+/** The default-model row the panel renders; capacity fields appear when known. */
+interface ModelSection {
+  provider: string
+  model: string
+  name?: string
+  contextWindow?: number
+  maxTokens?: number
+  reasoningEffort?: string
+  reasoningEfforts?: string[]
+}
+
 /**
  * Read the default model selection and resolve its capacity.
  * @param ctx - Host plugin context.
@@ -1551,7 +1620,7 @@ async function readModel(ctx, config) {
   if (llm === undefined || selection === undefined || selection?.provider === undefined || selection?.model === undefined) {
     return null
   }
-  const section = { provider: selection.provider, model: selection.model }
+  const section: ModelSection = { provider: selection.provider, model: selection.model }
   if (selection.reasoningEffort !== undefined) section.reasoningEffort = selection.reasoningEffort
   try {
     const info = await withTimeout(llm.resolveModelInfo(selection.provider, selection.model), config.requestTimeoutMs)
@@ -1566,13 +1635,20 @@ async function readModel(ctx, config) {
   return section
 }
 
+/** Deployment limits other services expose; every row is optional. */
+interface PlatformSection {
+  subagentDepth?: number
+  images?: { maxBytes?: number; maxPerMessage?: number; maxMessageBytes?: number }
+  scheduleIntervalSeconds?: number
+}
+
 /**
  * Read deployment limits other services expose.
  * @param ctx - Host plugin context.
  * @returns the platform section.
  */
 async function readPlatform(ctx) {
-  const platform = {}
+  const platform: PlatformSection = {}
   try {
     const depth = service(ctx, 'subagents')?.resolveMaxDepth?.()
     if (typeof depth === 'number') platform.subagentDepth = depth
@@ -1615,7 +1691,7 @@ async function timedFetch(url, init, config) {
 }
 
 /** @param provider - provider section. @param response - failed response. @returns the failed section. */
-function httpFailure(provider, response, secret) {
+function httpFailure(provider, response, secret?: string) {
   const status = response.status
   const base = secret === undefined ? provider : { ...provider, secret }
   if (status === 401 || status === 403) {

@@ -1,5 +1,31 @@
 import { isIP } from 'node:net'
 
+/** Native DSH admission the loopback guard defers to on managed listeners. */
+export interface NativeConnection {
+  allowsRemoteAuthorities?: boolean
+  requestRejection?(request: unknown): number | undefined
+}
+
+/** Web-server members the guard and the facade read. */
+export interface WebServer {
+  host?: string
+  getOrigin(): string
+  register(route: unknown): () => void
+}
+
+/** Cordis context slice the loopback guard reads; every member is optional. */
+interface AuthContext {
+  get?(name: 'connection'): NativeConnection | undefined
+  connection?: NativeConnection | undefined
+  logger?: { warn?(message: string): void }
+}
+
+/** Admission verdict: `required` when the request may proceed, `status` to reject it with. */
+interface Admission {
+  required?: boolean
+  status?: number
+}
+
 function loopback(host) {
   const value = String(host ?? '').replace(/^\[|\]$/g, '').toLowerCase()
   return value === 'localhost' || value === '::1' || (isIP(value) === 4 && value.startsWith('127.'))
@@ -9,7 +35,7 @@ function connectionFor(ctx) {
   return typeof ctx.get === 'function' ? ctx.get('connection') : ctx.connection
 }
 
-function admission(ctx, server, request) {
+function admission(ctx, server, request): Admission {
   try {
     const connection = connectionFor(ctx)
     const required = Boolean(process.env.WORKSTATION_DSH_LAN_AUTHORITY?.trim())
@@ -46,7 +72,7 @@ function nodeRequest(request, headers) {
 /** Protect private plugin routes with native DSH admission before adapting legacy loopback guards.
  * The facade leaves the host server and private-only desktop transports unchanged.
  */
-export function authenticatedWebServer(ctx, server) {
+export function authenticatedWebServer(ctx: AuthContext, server: WebServer): WebServer {
   if (!server) return server
   return new Proxy(server, {
     get(target, key) {

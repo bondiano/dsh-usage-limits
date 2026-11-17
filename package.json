@@ -5,20 +5,32 @@
   "type": "module",
   "description": "Left-sidebar limits panel: per-card subscription quotas (ChatGPT Codex, Claude, Grok, GitHub Copilot, Google Antigravity), provider windows, balances, model and platform limits.",
   "exports": {
-    ".": "./index.js",
-    "./client": "./client.js",
+    ".": {
+      "types": "./index.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": "./dist/client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
-    "index.js",
-    "client.js",
+    "dist/**/*.js",
+    "!dist/test/",
+    "index.ts",
+    "web-route-auth.ts",
     "cordis.patch.yml",
     "locale/*.json",
     "README.md",
     "icon.svg",
-    "web-route-auth.mjs"
+    "scripts/build-client.mjs",
+    "src/client.ts"
   ],
+  "scripts": {
+    "build": "tsc && node scripts/build-client.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "check": "npm run typecheck && npm test"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -32,12 +44,20 @@
       ]
     }
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/bondiano/dsh-usage-limits.git"
+  "dependencies": {
+    "xstate": "5.33.4"
+  },
+  "devDependencies": {
+    "@types/node": "22.18.6",
+    "esbuild": "^0.28.1",
+    "typescript": "7.0.2"
   },
   "homepage": "https://github.com/bondiano/dsh-usage-limits#readme",
   "bugs": {
     "url": "https://github.com/bondiano/dsh-usage-limits/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bondiano/dsh-usage-limits.git"
   }
 }
