@@ -1,0 +1,30 @@
+direction: down
+
+apply: "usage-limits apply\n[TypeScript, cordis]"
+guard: "web-route-auth\n[loopback guard, proxy]"
+webserver: "webServer service\n[DSH inject]"
+admission: "connection service\n[DSH admission]"
+route: "limits route\n[GET plugin-api route]"
+polls: "dag_provider_polls\n[readClaude, readGrok]"
+apis: "ex_provider_apis\n[anthropic.com, github.com]"
+oauth: "ex_oauth_tokens\n[claude.ai, googleapis]"
+subs: "db_subscriptions_bundle\n[auth.json, profiles]"
+creds: "credentials service\n[DSH, readRecord]"
+files: "db_cli_auth_files\n[.cursor, .factory]"
+overview: "overview services\n[llm, subagents, schedule]"
+client: "mf_limits_panel\n[React, sidebar panel]"
+slots: "mf_dsh_slots\n[main, sidebar.panellist]"
+
+apply -> route: registers route
+apply -> guard: wraps webServer
+guard -> webserver: proxy register
+guard -> admission: requestRejection
+route -> polls: readProviderSection
+route -> overview: readOverview
+polls -> apis: timedFetch usage
+polls -> oauth: token refresh
+polls -> subs: subscription grants
+polls -> creds: keys and grants
+polls -> files: cursor factory keys
+client -> route: fetch snapshot
+client -> slots: register panels
