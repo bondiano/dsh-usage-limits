@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-usage-limits",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Left-sidebar limits panel: per-card subscription quotas (ChatGPT Codex, Claude, Grok, GitHub Copilot, Google Antigravity), provider windows, balances, model and platform limits.",
